@@ -1,0 +1,1101 @@
+# =============================================================================
+# CrowPanel 1.28" Rotary  ->  Music Assistant / Spotify controller
+# Working state: ili9xxx+invert display, GPIO40 power seq, crash-free encoder,
+# safe button handler, scan:false touch, album art (hidden until loaded).
+# =============================================================================
+#
+# ------------------------------- FILL IN -------------------------------------
+substitutions:
+  ma_player: "media_player.kitchen_speaker_2"
+  ha_base: "http://192.168.25.42:8123"
+  spotify_default_uri: "Liked Songs Tone Deaf"
+  weather_entity: "weather.pirateweather"
+  radar_camera: "camera.nws_radar"
+  ltng_near_mi: "10"                        # red ring
+  ltng_mid_mi: "20"                         # orange ring
+  ltng_stale_s: "900"                       # strike stale after N sec
+#
+# Secrets: wifi_ssid, wifi_password, api_key
+# In HA: ESPHome device -> Configure -> "Allow device to perform HA actions" ON
+# -----------------------------------------------------------------------------
+
+esphome:
+  name: kitchen-knob
+  friendly_name: Kitchen Knob
+  platformio_options:
+    build_flags: "-DBOARD_HAS_PSRAM"
+    board_build.esp-idf.memory_type: qio_opi
+    board_build.flash_mode: dio
+  on_boot:
+    priority: 800
+    then:
+      - logger.log: "Boot: power + backlight"
+      - output.turn_on: backlight_pwm
+      - delay: 200ms
+      - output.turn_off: power_light        # GPIO40 LOW - lights the panel
+      - output.turn_on: lcd_power           # GPIO1
+      - output.turn_on: leda_power          # GPIO2
+      - delay: 500ms
+      - lambda: |-
+          id(encoder_ready) = true;
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+    version: recommended
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: !secret api_key
+ota:
+  - platform: esphome
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Kitchen-Knob"
+captive_portal:
+
+globals:
+  - id: volume_value
+    type: int
+    restore_value: false
+    initial_value: "30"
+  - id: encoder_ready
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: do_playpause
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: song_start_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: tsx
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: tsy
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: tex
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: tey
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: gesture
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: touch_start_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: browse_mode
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: playlist_index
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: playlist_count
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: playlists
+    type: std::vector<std::string>
+    restore_value: false
+  - id: last_tap_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: weather_mode
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  - id: wx_view
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: ltng_dist_mi
+    type: float
+    restore_value: false
+    initial_value: "999"
+  - id: ltng_last_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+
+# --- Arc repaint (decoupled from encoder to avoid LVGL reentrancy crash) -------
+interval:
+  - interval: 100ms
+    then:
+      - lvgl.arc.update:
+          id: vol_arc
+          value: !lambda 'return id(volume_value);'
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(weather_mode) && id(wx_view) == 4;'
+          then:
+            - lambda: 'id(radar_img).update();'
+  - interval: 15s
+    then:
+      - script.execute: update_ring
+
+# --- Buses --------------------------------------------------------------------
+spi:
+  id: spi_bus
+  clk_pin: GPIO10
+  mosi_pin: GPIO11
+
+i2c:
+  id: i2c_touch
+  sda: GPIO6
+  scl: GPIO7
+  frequency: 400kHz
+  scan: false
+
+# --- Power / backlight --------------------------------------------------------
+output:
+  - platform: ledc
+    pin: GPIO46
+    id: backlight_pwm
+    frequency: 5000Hz
+  - platform: gpio
+    pin: GPIO40
+    id: power_light
+  - platform: gpio
+    pin: GPIO1
+    id: lcd_power
+  - platform: gpio
+    pin: GPIO2
+    id: leda_power
+
+light:
+  - platform: monochromatic
+    name: "Backlight"
+    output: backlight_pwm
+    id: back_light
+    restore_mode: ALWAYS_ON
+  - platform: esp32_rmt_led_strip
+    id: ring
+    name: "Ring"
+    pin: GPIO48
+    num_leds: 5
+    chipset: WS2812
+    rgb_order: GRB
+    restore_mode: ALWAYS_OFF
+    default_transition_length: 0s
+
+# --- Display ------------------------------------------------------------------
+display:
+  - platform: ili9xxx
+    id: round_display
+    model: GC9A01A
+    cs_pin: GPIO9
+    dc_pin: GPIO3
+    reset_pin: GPIO14
+    invert_colors: true
+    rotation: 0
+    update_interval: 33ms
+
+# --- Touch (CST816 - skip_probe: chip sleeps and won't answer chip-ID read) ----
+touchscreen:
+  platform: cst816
+  id: touch
+  i2c_id: i2c_touch
+  address: 0x15
+  interrupt_pin: GPIO5
+  reset_pin: GPIO13
+  skip_probe: true
+  transform:
+    mirror_x: false
+    mirror_y: true
+    swap_xy: true
+  on_touch:
+    - lambda: |-
+        id(tsx) = touch.x; id(tsy) = touch.y;
+        id(tex) = touch.x; id(tey) = touch.y;
+        id(touch_start_ms) = millis();
+  on_update:
+    - lambda: |-
+        for (auto &tp : touches) {
+          if (tp.state == 1 || tp.state == 2) { id(tex) = tp.x; id(tey) = tp.y; }
+        }
+  on_release:
+    - if:
+        condition:
+          lvgl.is_paused:
+        then:
+          - script.execute: wake_display
+    - lambda: |-
+        int dx = id(tex) - id(tsx);
+        int dy = id(tey) - id(tsy);
+        uint32_t dt = millis() - id(touch_start_ms);
+        id(gesture) = 0;
+        if (id(browse_mode)) return;
+        // horizontal rides dy (swap_xy). right->next(1), left->restart/prev(2)
+        if (abs(dy) > 70 && abs(dy) > (abs(dx) * 2) && dt < 600) {
+          id(gesture) = (dy < 0) ? 2 : 1;
+        } else if (abs(dx) < 25 && abs(dy) < 25 && dt < 300) {
+          // tap; two within 400ms -> double-tap (gesture 3 = weather)
+          uint32_t now = millis();
+          if (now - id(last_tap_ms) < 400) { id(gesture) = 3; id(last_tap_ms) = 0; }
+          else { id(last_tap_ms) = now; }
+        }
+    - if:
+        condition:
+          lambda: 'return id(gesture) == 1;'
+        then:
+          - homeassistant.action:
+              action: media_player.media_next_track
+              data:
+                entity_id: ${ma_player}
+    - if:
+        condition:
+          lambda: 'return id(gesture) == 2;'
+        then:
+          - if:
+              condition:
+                lambda: 'return (millis() - id(song_start_ms)) < 10000;'
+              then:
+                - homeassistant.action:
+                    action: media_player.media_previous_track
+                    data:
+                      entity_id: ${ma_player}
+              else:
+                - homeassistant.action:
+                    action: media_player.media_seek
+                    data:
+                      entity_id: ${ma_player}
+                      seek_position: "0"
+    - if:
+        condition:
+          lambda: 'return id(gesture) == 3;'
+        then:
+          - lambda: |-
+              id(weather_mode) = true;
+              id(wx_view) = 0;
+          - script.execute: wx_show
+          - script.execute: weather_timer
+
+# --- Encoder -> volume  (crash-free: no lv_refr_now) --------------------------
+sensor:
+  - platform: rotary_encoder
+    id: knob
+    name: "Encoder"
+    pin_a:
+      number: GPIO45
+      mode:
+        input: true
+        pullup: true
+    pin_b:
+      number: GPIO42
+      mode:
+        input: true
+        pullup: true
+    resolution: 1
+    on_clockwise:
+      - script.execute: wake_display
+      - if:
+          condition:
+            lambda: 'return id(browse_mode);'
+          then:
+            - lambda: |-
+                if (id(playlist_count) == 0) return;
+                id(playlist_index) = (id(playlist_index) + 1) % id(playlist_count);
+            - script.execute: refresh_browse_labels
+            - script.execute: browse_timer
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(weather_mode);'
+                then:
+                  - lambda: 'id(wx_view) = (id(wx_view) + 1) % 5;'
+                  - script.execute: wx_show
+                  - script.execute: weather_timer
+                else:
+                  - if:
+                      condition:
+                        lambda: 'return id(encoder_ready);'
+                      then:
+                        - lambda: 'id(volume_value) = std::min(id(volume_value) + 4, 100);'
+                        - homeassistant.action:
+                            action: media_player.volume_set
+                            data:
+                              entity_id: ${ma_player}
+                              volume_level: !lambda 'return id(volume_value) / 100.0f;'
+    on_anticlockwise:
+      - script.execute: wake_display
+      - if:
+          condition:
+            lambda: 'return id(browse_mode);'
+          then:
+            - lambda: |-
+                if (id(playlist_count) == 0) return;
+                id(playlist_index) = (id(playlist_index) - 1 + id(playlist_count)) % id(playlist_count);
+            - script.execute: refresh_browse_labels
+            - script.execute: browse_timer
+          else:
+            - if:
+                condition:
+                  lambda: 'return id(weather_mode);'
+                then:
+                  - lambda: 'id(wx_view) = (id(wx_view) + 4) % 5;'
+                  - script.execute: wx_show
+                  - script.execute: weather_timer
+                else:
+                  - if:
+                      condition:
+                        lambda: 'return id(encoder_ready);'
+                      then:
+                        - lambda: 'id(volume_value) = std::max(id(volume_value) - 4, 0);'
+                        - homeassistant.action:
+                            action: media_player.volume_set
+                            data:
+                              entity_id: ${ma_player}
+                              volume_level: !lambda 'return id(volume_value) / 100.0f;'
+
+  - platform: homeassistant
+    id: ma_volume
+    entity_id: ${ma_player}
+    attribute: volume_level
+    on_value:
+      - lambda: 'id(volume_value) = (int)(x * 100.0f);'
+
+  # Weather - Now page
+  - platform: homeassistant
+    id: wx_temp
+    entity_id: sensor.crystal_lake_weather_outdoor_temperature
+    on_value:
+      - lvgl.label.update:
+          id: wx_temp_lbl
+          text: !lambda 'char b[16]; snprintf(b,sizeof(b),"%d\xC2\xB0",(int)lroundf(x)); return std::string(b);'
+  - platform: homeassistant
+    id: wx_feels
+    entity_id: ${weather_entity}
+    attribute: apparent_temperature
+    on_value:
+      - lvgl.label.update:
+          id: wx_feels_lbl
+          text: !lambda 'char b[24]; snprintf(b,sizeof(b),"feels %d\xC2\xB0",(int)lroundf(x)); return std::string(b);'
+  # Weather - Wind page
+  - platform: homeassistant
+    id: wx_wind
+    entity_id: sensor.crystal_lake_weather_wind_speed
+    on_value:
+      - lvgl.label.update:
+          id: wx_wind_lbl
+          text: !lambda 'char b[16]; snprintf(b,sizeof(b),"%d mph",(int)lroundf(x)); return std::string(b);'
+  - platform: homeassistant
+    id: wx_gust
+    entity_id: sensor.crystal_lake_weather_wind_gust
+    on_value:
+      - lvgl.label.update:
+          id: wx_gust_lbl
+          text: !lambda 'char b[20]; snprintf(b,sizeof(b),"gust %d",(int)lroundf(x)); return std::string(b);'
+  - platform: homeassistant
+    id: wx_bearing
+    entity_id: sensor.crystal_lake_weather_wind_direction
+    on_value:
+      - lvgl.label.update:
+          id: wx_dir_lbl
+          text: !lambda |-
+            const char* d[] = {"N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"};
+            int i = ((int)((x + 11.25f) / 22.5f)) % 16;
+            char b[24]; snprintf(b,sizeof(b),"%s  %d\xC2\xB0", d[i], (int)lroundf(x));
+            return std::string(b);
+  # Weather - Air page
+  - platform: homeassistant
+    id: wx_humidity
+    entity_id: sensor.crystal_lake_weather_humidity
+    on_value:
+      - lvgl.label.update:
+          id: wx_hum_lbl
+          text: !lambda 'char b[16]; snprintf(b,sizeof(b),"%d%% RH",(int)lroundf(x)); return std::string(b);'
+  - platform: homeassistant
+    id: wx_dew
+    entity_id: ${weather_entity}
+    attribute: dew_point
+    on_value:
+      - lvgl.label.update:
+          id: wx_dew_lbl
+          text: !lambda 'char b[20]; snprintf(b,sizeof(b),"dew %d\xC2\xB0",(int)lroundf(x)); return std::string(b);'
+  - platform: homeassistant
+    id: wx_pressure
+    entity_id: ${weather_entity}
+    attribute: pressure
+    on_value:
+      - lvgl.label.update:
+          id: wx_press_lbl
+          text: !lambda 'char b[24]; snprintf(b,sizeof(b),"%.2f inHg", x); return std::string(b);'
+  # Lightning compass
+  - platform: homeassistant
+    id: wx_azimuth
+    entity_id: sensor.blitzortung_lightning_azimuth
+    on_value:
+      - lvgl.indicator.update:
+          id: compass_needle
+          value: !lambda 'return ((int)lroundf(x) + 270) % 360;'
+      - lvgl.label.update:
+          id: ltng_card_lbl
+          text: !lambda |-
+            const char* d[]={"N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"};
+            int i=((int)((x+11.25f)/22.5f))%16;
+            return std::string(d[i]);
+      - lvgl.label.update:
+          id: ltng_deg_lbl
+          text: !lambda 'char b[8]; snprintf(b,sizeof(b),"%d\xC2\xB0",(int)lroundf(x)); return std::string(b);'
+
+# --- Knob press -> play/pause, or start Spotify if idle (SAFE string guard) ----
+binary_sensor:
+  - platform: gpio
+    id: knob_button
+    pin:
+      number: GPIO41
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_multi_click:
+      # single click: browse->select+play ; else->play/pause or start
+      - timing:
+          - ON for at most 400ms
+          - OFF for at least 350ms
+        then:
+          - script.execute: wake_display
+          - if:
+              condition:
+                lambda: 'return id(weather_mode);'
+              then:
+                - lambda: 'id(weather_mode) = false;'
+                - lvgl.page.show: page_now
+              else:
+                - if:
+                    condition:
+                      lambda: 'return id(browse_mode);'
+                    then:
+                      - if:
+                          condition:
+                            lambda: 'return id(playlist_count) > 0;'
+                          then:
+                            - homeassistant.action:
+                                action: music_assistant.play_media
+                                data:
+                                  entity_id: ${ma_player}
+                                  media_id: !lambda 'return id(playlists)[id(playlist_index)];'
+                      - lambda: 'id(browse_mode) = false;'
+                      - lvgl.page.show: page_now
+                    else:
+                      - lambda: |-
+                          std::string st = id(ma_state).state;
+                          id(do_playpause) = (st == "playing" || st == "paused");
+                      - if:
+                          condition:
+                            lambda: 'return id(do_playpause);'
+                          then:
+                            - homeassistant.action:
+                                action: media_player.media_play_pause
+                                data:
+                                  entity_id: ${ma_player}
+                          else:
+                            - homeassistant.action:
+                                action: music_assistant.play_media
+                                data:
+                                  entity_id: ${ma_player}
+                                  media_id: ${spotify_default_uri}
+      # double click: enter playlist browser
+      - timing:
+          - ON for at most 400ms
+          - OFF for at most 400ms
+          - ON for at most 400ms
+          - OFF for at least 50ms
+        then:
+          - script.execute: wake_display
+          - lambda: |-
+              id(browse_mode) = true;
+              id(playlist_index) = 0;
+          - script.execute: refresh_browse_labels
+          - lvgl.page.show: page_browse
+          - script.execute: browse_timer
+
+# --- MA state -> panel --------------------------------------------------------
+text_sensor:
+  - platform: homeassistant
+    id: ltng_dist
+    entity_id: sensor.lightning_distance_display
+    on_value:
+      - lambda: |-
+          id(ltng_dist_mi) = atof(x.c_str());
+          id(ltng_last_ms) = millis();
+      - lvgl.label.update:
+          id: ltng_dist_lbl
+          text: !lambda |-
+            char b[24]; snprintf(b,sizeof(b),"%.0f mi", id(ltng_dist_mi));
+            return std::string(b);
+      - if:
+          condition:
+            lambda: 'return id(ltng_dist_mi) < ${ltng_mid_mi};'
+          then:
+            - script.execute: ltng_flicker
+          else:
+            - script.execute: update_ring
+  - platform: homeassistant
+    id: radar_pic
+    entity_id: ${radar_camera}
+    attribute: entity_picture
+    on_value:
+      - lambda: |-
+          std::string p = x;
+          if (p.empty()) return;
+          std::string url = (p[0] == '/') ? std::string("${ha_base}") + p : p;
+          // &width forces HA to decode the GIF via PIL and return JPEG
+          url += "&width=480&height=480";
+          id(radar_img).set_url(url.c_str());
+          id(radar_img).update();
+  - platform: homeassistant
+    id: wx_condition
+    entity_id: ${weather_entity}
+    on_value:
+      - lvgl.label.update:
+          id: wx_cond_lbl
+          text: !lambda 'return x;'
+      - lvgl.label.update:
+          id: wx_icon_lbl
+          text: !lambda |-
+            std::string c = x;
+            if (c=="sunny")            return std::string("\U000F0599");
+            if (c=="clear-night")      return std::string("\U000F0594");
+            if (c=="cloudy")           return std::string("\U000F0590");
+            if (c=="partlycloudy")     return std::string("\U000F0595");
+            if (c=="rainy")            return std::string("\U000F0597");
+            if (c=="pouring")          return std::string("\U000F0596");
+            if (c=="lightning")        return std::string("\U000F0593");
+            if (c=="lightning-rainy")  return std::string("\U000F067E");
+            if (c=="snowy")            return std::string("\U000F0598");
+            if (c=="snowy-rainy")      return std::string("\U000F067F");
+            if (c=="hail")             return std::string("\U000F0592");
+            if (c=="fog")              return std::string("\U000F0591");
+            if (c=="windy")            return std::string("\U000F059D");
+            if (c=="windy-variant")    return std::string("\U000F059E");
+            return std::string("\U000F0590");
+  - platform: homeassistant
+    id: wx_hilo
+    entity_id: sensor.knob_weather_hilo
+    attribute: hilo
+    on_value:
+      - lvgl.label.update:
+          id: wx_hilo_lbl
+          text: !lambda |-
+            std::string s = x;            // "94/74"
+            size_t sl = s.find('/');
+            if (sl == std::string::npos) return std::string("");
+            char b[32];
+            snprintf(b,sizeof(b),"H %s\xC2\xB0  L %s\xC2\xB0",
+                     s.substr(0,sl).c_str(), s.substr(sl+1).c_str());
+            return std::string(b);
+  - platform: homeassistant
+    id: pl_names
+    entity_id: sensor.knob_playlists
+    attribute: names
+    on_value:
+      - lambda: |-
+          id(playlists).clear();
+          std::string str = x;
+          size_t pos = 0;
+          while (pos <= str.size()) {
+            size_t nl = str.find('\n', pos);
+            std::string item = (nl == std::string::npos) ? str.substr(pos) : str.substr(pos, nl - pos);
+            if (!item.empty()) id(playlists).push_back(item);
+            if (nl == std::string::npos) break;
+            pos = nl + 1;
+          }
+          id(playlist_count) = (int) id(playlists).size();
+  - platform: homeassistant
+    id: ma_state
+    entity_id: ${ma_player}
+    on_value:
+      - script.execute: update_ring
+  - platform: homeassistant
+    id: ma_title
+    entity_id: ${ma_player}
+    attribute: media_title
+    on_value:
+      - lambda: 'id(song_start_ms) = millis();'
+      - lvgl.label.update:
+          id: title_lbl
+          text: !lambda "return x.c_str();"
+  - platform: homeassistant
+    id: ma_artist
+    entity_id: ${ma_player}
+    attribute: media_artist
+    on_value:
+      - lvgl.label.update:
+          id: artist_lbl
+          text: !lambda "return x.c_str();"
+
+  - platform: homeassistant
+    id: ma_art
+    entity_id: ${ma_player}
+    attribute: entity_picture
+    on_value:
+      - lambda: |-
+          static std::string last_url;
+          std::string p = x;
+          if (p.empty()) return;
+          std::string url = (p[0] == '/') ? std::string("${ha_base}") + p : p;
+          // MA imageproxy only accepts specific size values; 256 is valid, 128 is not (400)
+          size_t q = url.find("size=512");
+          if (q != std::string::npos) url.replace(q + 5, 3, "256");
+          if (url == last_url) return;   // ignore idle/playing flap re-firing same art
+          last_url = url;
+          id(album_art).set_url(url.c_str());
+          id(album_art).update();
+
+http_request:
+  timeout: 10s
+  verify_ssl: false
+
+online_image:
+  - id: album_art
+    url: "${ha_base}/api/media_player_proxy/${ma_player}"
+    format: JPEG
+    type: RGB565
+    resize: 130x130
+    update_interval: never
+    on_download_finished:
+      - lvgl.widget.show: art_widget
+      - lvgl.image.update:
+          id: art_widget
+          src: album_art
+  - id: radar_img
+    url: "${ha_base}/api/camera_proxy/${radar_camera}"
+    format: JPEG
+    type: RGB565
+    resize: 240x240
+    update_interval: never
+    on_download_finished:
+      - lvgl.image.update:
+          id: radar_widget
+          src: radar_img
+
+font:
+  - file: "gfonts://Montserrat"
+    id: montserrat_20
+    size: 20
+  - file: "gfonts://Montserrat"
+    id: montserrat_14
+    size: 14
+  - file: "gfonts://Montserrat"
+    id: montserrat_30
+    size: 30
+  # Drop materialdesignicons-webfont.ttf into config/fonts/
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: weather_icons
+    size: 58
+    glyphs: [
+      "\U000F0590","\U000F0591","\U000F0592","\U000F0593","\U000F0594",
+      "\U000F0595","\U000F0596","\U000F0597","\U000F0598","\U000F0599",
+      "\U000F059D","\U000F059E","\U000F067E","\U000F067F"
+    ]
+
+# --- UI -----------------------------------------------------------------------
+script:
+  - id: wake_display
+    then:
+      - if:
+          condition:
+            lvgl.is_paused:
+          then:
+            - lvgl.resume:
+            - lvgl.widget.redraw:
+            - light.turn_on:
+                id: back_light
+                brightness: 100%
+  - id: update_ring
+    then:
+      - lambda: |-
+          bool recent = (millis() - id(ltng_last_ms)) < (${ltng_stale_s} * 1000UL);
+          float d = id(ltng_dist_mi);
+          if (recent && d < ${ltng_near_mi}) {
+            id(ring).turn_on().set_rgb(1.0f, 0.0f, 0.0f).set_brightness(0.7f).perform();
+          } else if (recent && d < ${ltng_mid_mi}) {
+            id(ring).turn_on().set_rgb(1.0f, 0.42f, 0.0f).set_brightness(0.6f).perform();
+          } else if (id(ma_state).state == "playing") {
+            id(ring).turn_on().set_rgb(0.0f, 1.0f, 0.2f).set_brightness(0.4f).perform();
+          } else {
+            id(ring).turn_off().perform();
+          }
+      - if:
+          condition:
+            lambda: 'return (millis() - id(ltng_last_ms)) >= (${ltng_stale_s} * 1000UL);'
+          then:
+            - lvgl.label.update: { id: ltng_card_lbl, text: "--" }
+            - lvgl.label.update: { id: ltng_deg_lbl, text: "" }
+            - lvgl.label.update: { id: ltng_dist_lbl, text: "no strikes" }
+  - id: ltng_flicker
+    mode: restart
+    then:
+      - light.turn_on:
+          id: ring
+          red: 100%
+          green: 100%
+          blue: 100%
+          brightness: 100%
+      - delay: 45ms
+      - light.turn_off: ring
+      - delay: 45ms
+      - script.execute: update_ring
+  - id: refresh_browse_labels
+    then:
+      - lvgl.label.update:
+          id: pl_cur
+          text: !lambda |-
+            if (id(playlist_count) == 0) return std::string("(no playlists)");
+            return id(playlists)[id(playlist_index)];
+      - lvgl.label.update:
+          id: pl_prev
+          text: !lambda |-
+            if (id(playlist_count) < 2) return std::string("");
+            int i = (id(playlist_index) - 1 + id(playlist_count)) % id(playlist_count);
+            return id(playlists)[i];
+      - lvgl.label.update:
+          id: pl_next
+          text: !lambda |-
+            if (id(playlist_count) < 2) return std::string("");
+            int i = (id(playlist_index) + 1) % id(playlist_count);
+            return id(playlists)[i];
+  - id: browse_timer
+    mode: restart
+    then:
+      - delay: 12s
+      - lambda: 'id(browse_mode) = false;'
+      - lvgl.page.show: page_now
+  - id: weather_timer
+    mode: restart
+    then:
+      - delay: !lambda 'return (id(wx_view) >= 3) ? 600000 : 10000;'
+      - lambda: 'id(weather_mode) = false;'
+      - lvgl.page.show: page_now
+  - id: wx_show
+    then:
+      - if:
+          condition: {lambda: 'return id(wx_view) == 0;'}
+          then: [{lvgl.page.show: page_wx_now}]
+      - if:
+          condition: {lambda: 'return id(wx_view) == 1;'}
+          then: [{lvgl.page.show: page_wx_wind}]
+      - if:
+          condition: {lambda: 'return id(wx_view) == 2;'}
+          then: [{lvgl.page.show: page_wx_air}]
+      - if:
+          condition: {lambda: 'return id(wx_view) == 3;'}
+          then: [{lvgl.page.show: page_wx_lightning}]
+      - if:
+          condition: {lambda: 'return id(wx_view) == 4;'}
+          then:
+            - lvgl.page.show: page_wx_radar
+            - lambda: 'id(radar_img).update();'
+
+lvgl:
+  displays:
+    - round_display
+  touchscreens:
+    - touch
+  buffer_size: 50%
+  on_idle:
+    timeout: 120s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(ma_state).state != "playing" && !id(weather_mode);'
+          then:
+            - light.turn_off: back_light
+            - lvgl.pause:
+  bg_color: "0x000000"
+  pages:
+    - id: page_now
+      widgets:
+        - arc:
+            align: CENTER
+            id: vol_arc
+            value: 30
+            min_value: 0
+            max_value: 100
+            start_angle: 180
+            end_angle: 360
+            width: 236
+            height: 236
+            arc_color: "0x1A1A1A"
+            arc_width: 8
+            indicator:
+              arc_color: "0x1DB954"
+              arc_width: 8
+            knob:
+              bg_opa: "0%"
+        - image:
+            align: CENTER
+            id: art_widget
+            src: album_art
+            y: -12
+            hidden: true
+        - label:
+            align: CENTER
+            id: title_lbl
+            y: 60
+            text_font: montserrat_20
+            text: ""
+            text_color: "0xFFFFFF"
+            long_mode: scroll
+        - label:
+            align: CENTER
+            id: artist_lbl
+            y: 84
+            text_font: montserrat_14
+            text: ""
+            text_color: "0xB3B3B3"
+            long_mode: scroll
+    - id: page_browse
+      widgets:
+        - label:
+            align: TOP_MID
+            y: 30
+            text: "PLAYLISTS"
+            text_font: montserrat_14
+            text_color: "0x1DB954"
+        - label:
+            align: CENTER
+            id: pl_prev
+            y: -46
+            text_font: montserrat_14
+            text: ""
+            text_color: "0x555555"
+            long_mode: dot
+            text_align: CENTER
+            width: 200
+        - label:
+            align: CENTER
+            id: pl_cur
+            y: 0
+            text_font: montserrat_20
+            text: "(no playlists)"
+            text_color: "0xFFFFFF"
+            long_mode: scroll
+            text_align: CENTER
+            width: 210
+        - label:
+            align: CENTER
+            id: pl_next
+            y: 46
+            text_font: montserrat_14
+            text: ""
+            text_color: "0x555555"
+            long_mode: dot
+            text_align: CENTER
+            width: 200
+    - id: page_wx_now
+      widgets:
+        - label:
+            align: CENTER
+            id: wx_icon_lbl
+            y: -52
+            text_font: weather_icons
+            text: ""
+            text_color: "0xFFFFFF"
+        - label:
+            align: CENTER
+            id: wx_temp_lbl
+            y: 6
+            text_font: montserrat_30
+            text: "--"
+            text_color: "0xFFFFFF"
+        - label:
+            align: CENTER
+            id: wx_feels_lbl
+            y: 40
+            text_font: montserrat_14
+            text: ""
+            text_color: "0x999999"
+        - label:
+            align: CENTER
+            id: wx_hilo_lbl
+            y: 62
+            text_font: montserrat_14
+            text: ""
+            text_color: "0xB3B3B3"
+        - label:
+            align: CENTER
+            id: wx_cond_lbl
+            y: 84
+            text_font: montserrat_14
+            text: ""
+            text_color: "0x777777"
+            long_mode: scroll
+            text_align: CENTER
+            width: 180
+    - id: page_wx_wind
+      widgets:
+        - label:
+            align: TOP_MID
+            y: 30
+            text: "WIND"
+            text_font: montserrat_14
+            text_color: "0x00A6FF"
+        - label:
+            align: CENTER
+            id: wx_wind_lbl
+            y: -18
+            text_font: montserrat_30
+            text: "--"
+            text_color: "0xFFFFFF"
+        - label:
+            align: CENTER
+            id: wx_gust_lbl
+            y: 22
+            text_font: montserrat_14
+            text: ""
+            text_color: "0x999999"
+        - label:
+            align: CENTER
+            id: wx_dir_lbl
+            y: 46
+            text_font: montserrat_14
+            text: ""
+            text_color: "0xB3B3B3"
+    - id: page_wx_air
+      widgets:
+        - label:
+            align: TOP_MID
+            y: 30
+            text: "AIR"
+            text_font: montserrat_14
+            text_color: "0x00A6FF"
+        - label:
+            align: CENTER
+            id: wx_hum_lbl
+            y: -22
+            text_font: montserrat_20
+            text: "--"
+            text_color: "0xFFFFFF"
+        - label:
+            align: CENTER
+            id: wx_dew_lbl
+            y: 10
+            text_font: montserrat_14
+            text: ""
+            text_color: "0x999999"
+        - label:
+            align: CENTER
+            id: wx_press_lbl
+            y: 34
+            text_font: montserrat_14
+            text: ""
+            text_color: "0xB3B3B3"
+    - id: page_wx_lightning
+      widgets:
+        - meter:
+            id: compass_meter
+            align: CENTER
+            width: 172
+            height: 172
+            radius: 86
+            bg_opa: TRANSP
+            border_width: 2
+            border_color: "0x00A6FF"
+            scales:
+              - range_from: 0
+                range_to: 360
+                angle_range: 360
+                rotation: 0
+                ticks:
+                  count: 12
+                  width: 2
+                  length: 6
+                  color: "0x004A6E"
+                indicators:
+                  - line:
+                      id: compass_needle
+                      width: 5
+                      color: "0xFFA500"
+                      r_mod: -12
+                      value: 270
+        - label:
+            align: TOP_MID
+            y: 20
+            text: "N"
+            text_font: montserrat_14
+            text_color: "0x00A6FF"
+        - label:
+            align: BOTTOM_MID
+            y: -20
+            text: "S"
+            text_font: montserrat_14
+            text_color: "0x00A6FF"
+        - label:
+            align: RIGHT_MID
+            x: -20
+            text: "E"
+            text_font: montserrat_14
+            text_color: "0x00A6FF"
+        - label:
+            align: LEFT_MID
+            x: 20
+            text: "W"
+            text_font: montserrat_14
+            text_color: "0x00A6FF"
+        - label:
+            align: CENTER
+            id: ltng_card_lbl
+            y: -14
+            text_font: montserrat_20
+            text: "--"
+            text_color: "0xFFFFFF"
+            text_align: CENTER
+        - label:
+            align: CENTER
+            id: ltng_deg_lbl
+            y: 12
+            text_font: montserrat_14
+            text: ""
+            text_color: "0xB3B3B3"
+            text_align: CENTER
+        - label:
+            align: CENTER
+            id: ltng_dist_lbl
+            y: 34
+            text_font: montserrat_14
+            text: ""
+            text_color: "0x999999"
+            text_align: CENTER
+    - id: page_wx_radar
+      widgets:
+        - image:
+            align: CENTER
+            id: radar_widget
+            src: radar_img
+        - label:
+            align: TOP_MID
+            y: 8
+            text: "RADAR"
+            text_font: montserrat_14
+            text_color: "0x00A6FF"

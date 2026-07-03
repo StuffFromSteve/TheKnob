@@ -1,0 +1,47 @@
+# Add to configuration.yaml (or a template: package).
+# Populates sensor.knob_playlists: state = count, names attr = newline-joined list.
+template:
+  - trigger:
+      - trigger: homeassistant
+        event: start
+      - trigger: time_pattern
+        hours: "/6"
+      - trigger: event
+        event_type: refresh_knob_playlists   # fire to refresh on demand
+    action:
+      - action: music_assistant.get_library
+        data:
+          media_type: playlist
+          config_entry_id: 01JERQZ9CRRNWXMVQE1G3BTP31
+          limit: 100
+          order_by: name
+        response_variable: pls
+    sensor:
+      - name: Knob Playlists
+        unique_id: knob_playlists
+        state: "{{ pls['items'] | length }}"
+        attributes:
+          names: "{{ pls['items'] | map(attribute='name') | join('\n') }}"
+
+# --- Today's high/low for the knob weather page --------------------------------
+# get_forecasts is action-based now; expose today's hi/lo as a sensor attribute.
+  - trigger:
+      - trigger: homeassistant
+        event: start
+      - trigger: time_pattern
+        minutes: "/15"
+    action:
+      - action: weather.get_forecasts
+        target:
+          entity_id: weather.pirateweather
+        data:
+          type: daily
+        response_variable: fc
+    sensor:
+      - name: Knob Weather HiLo
+        unique_id: knob_weather_hilo
+        state: "{{ fc['weather.pirateweather'].forecast[0].temperature | round }}"
+        attributes:
+          hilo: >-
+            {% set d = fc['weather.pirateweather'].forecast[0] %}
+            {{ d.temperature | round }}/{{ d.templow | round }}
