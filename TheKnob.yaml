@@ -14,6 +14,7 @@ substitutions:
   ltng_near_mi: "10"                        # red ring
   ltng_mid_mi: "20"                         # orange ring
   ltng_stale_s: "900"                       # strike stale after N sec
+  ring_bright: "0.35"                        # ring brightness 0.0-1.0 (steady + flash)
 #
 # Secrets: wifi_ssid, wifi_password, api_key
 # In HA: ESPHome device -> Configure -> "Allow device to perform HA actions" ON
@@ -29,7 +30,6 @@ esphome:
   on_boot:
     priority: 800
     then:
-      - logger.log: "Boot: power + backlight"
       - output.turn_on: backlight_pwm
       - delay: 200ms
       - output.turn_off: power_light        # GPIO40 LOW - lights the panel
@@ -50,7 +50,7 @@ psram:
   speed: 80MHz
 
 logger:
-  level: DEBUG
+  level: INFO
 
 api:
   encryption:
@@ -738,11 +738,11 @@ script:
           bool recent = (millis() - id(ltng_last_ms)) < (${ltng_stale_s} * 1000UL);
           float d = id(ltng_dist_mi);
           if (recent && d < ${ltng_near_mi}) {
-            id(ring).turn_on().set_rgb(1.0f, 0.0f, 0.0f).set_brightness(0.7f).perform();
+            id(ring).turn_on().set_rgb(1.0f, 0.0f, 0.0f).set_brightness(${ring_bright}).perform();
           } else if (recent && d < ${ltng_mid_mi}) {
-            id(ring).turn_on().set_rgb(1.0f, 0.42f, 0.0f).set_brightness(0.6f).perform();
+            id(ring).turn_on().set_rgb(1.0f, 0.42f, 0.0f).set_brightness(${ring_bright}).perform();
           } else if (id(ma_state).state == "playing") {
-            id(ring).turn_on().set_rgb(0.0f, 1.0f, 0.2f).set_brightness(0.4f).perform();
+            id(ring).turn_on().set_rgb(0.0f, 1.0f, 0.2f).set_brightness(${ring_bright}).perform();
           } else {
             id(ring).turn_off().perform();
           }
@@ -756,13 +756,12 @@ script:
   - id: ltng_flicker
     mode: restart
     then:
-      - light.turn_on:
-          id: ring
-          red: 100%
-          green: 100%
-          blue: 100%
-          brightness: 100%
-      - delay: 45ms
+      - lambda: |-
+          if (id(ltng_dist_mi) < ${ltng_near_mi})
+            id(ring).turn_on().set_rgb(1.0f, 0.0f, 0.0f).set_brightness(${ring_bright}).perform();
+          else
+            id(ring).turn_on().set_rgb(1.0f, 0.42f, 0.0f).set_brightness(${ring_bright}).perform();
+      - delay: 55ms
       - light.turn_off: ring
       - delay: 45ms
       - script.execute: update_ring
@@ -1028,7 +1027,7 @@ lvgl:
                 angle_range: 360
                 rotation: 0
                 ticks:
-                  count: 12
+                  count: 13
                   width: 2
                   length: 6
                   color: "0x004A6E"
@@ -1041,27 +1040,27 @@ lvgl:
                       value: 270
         - label:
             align: TOP_MID
-            y: 20
+            y: 8
             text: "N"
-            text_font: montserrat_14
+            text_font: montserrat_20
             text_color: "0x00A6FF"
         - label:
             align: BOTTOM_MID
-            y: -20
+            y: -8
             text: "S"
-            text_font: montserrat_14
+            text_font: montserrat_20
             text_color: "0x00A6FF"
         - label:
             align: RIGHT_MID
-            x: -20
+            x: -16
             text: "E"
-            text_font: montserrat_14
+            text_font: montserrat_20
             text_color: "0x00A6FF"
         - label:
             align: LEFT_MID
-            x: 20
+            x: 4
             text: "W"
-            text_font: montserrat_14
+            text_font: montserrat_20
             text_color: "0x00A6FF"
         - label:
             align: CENTER
