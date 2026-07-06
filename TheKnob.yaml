@@ -451,18 +451,22 @@ sensor:
     id: wx_azimuth
     entity_id: sensor.blitzortung_lightning_azimuth
     on_value:
-      - lvgl.indicator.update:
-          id: compass_needle
-          value: !lambda 'return ((int)lroundf(x) + 270) % 360;'
-      - lvgl.label.update:
-          id: ltng_card_lbl
-          text: !lambda |-
-            const char* d[]={"N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"};
-            int i=((int)((x+11.25f)/22.5f))%16;
-            return std::string(d[i]);
-      - lvgl.label.update:
-          id: ltng_deg_lbl
-          text: !lambda 'char b[8]; snprintf(b,sizeof(b),"%d\xC2\xB0",(int)lroundf(x)); return std::string(b);'
+      - if:
+          condition:
+            lambda: 'return !isnan(x);'
+          then:
+            - lvgl.indicator.update:
+                id: compass_needle
+                value: !lambda 'return ((int)lroundf(x) + 270) % 360;'
+            - lvgl.label.update:
+                id: ltng_card_lbl
+                text: !lambda |-
+                  const char* d[]={"N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"};
+                  int i=((int)((x+11.25f)/22.5f))%16;
+                  return std::string(d[i]);
+            - lvgl.label.update:
+                id: ltng_deg_lbl
+                text: !lambda 'char b[8]; snprintf(b,sizeof(b),"%d\xC2\xB0",(int)lroundf(x)); return std::string(b);'
 
 # --- Knob press -> play/pause, or start Spotify if idle (SAFE string guard) ----
 binary_sensor:
@@ -519,11 +523,22 @@ binary_sensor:
                                 data:
                                   entity_id: ${ma_player}
                           else:
+                            # idle: resume the last MA queue (playlist/podcast/album + position);
+                            # fall back to the default only if nothing resumed within 1.5s
                             - homeassistant.action:
-                                action: music_assistant.play_media
+                                action: media_player.media_play
                                 data:
                                   entity_id: ${ma_player}
-                                  media_id: ${spotify_default_uri}
+                            - delay: 1500ms
+                            - if:
+                                condition:
+                                  lambda: 'return id(ma_state).state != "playing";'
+                                then:
+                                  - homeassistant.action:
+                                      action: music_assistant.play_media
+                                      data:
+                                        entity_id: ${ma_player}
+                                        media_id: ${spotify_default_uri}
       # double click: enter playlist browser
       - timing:
           - ON for at most 400ms
@@ -546,13 +561,24 @@ text_sensor:
     entity_id: sensor.lightning_distance_display
     on_value:
       - lambda: |-
-          id(ltng_dist_mi) = atof(x.c_str());
-          id(ltng_last_ms) = millis();
-      - lvgl.label.update:
-          id: ltng_dist_lbl
-          text: !lambda |-
-            char b[24]; snprintf(b,sizeof(b),"%.0f mi", id(ltng_dist_mi));
-            return std::string(b);
+          // strtod consumes nothing for "unknown"/"unavailable"/"-"/"" -> treat as NO strike
+          char* end = nullptr;
+          double v = strtod(x.c_str(), &end);
+          if (end == x.c_str()) {
+            id(ltng_dist_mi) = 999.0f;   // no data: far, no alert; do NOT restamp
+          } else {
+            id(ltng_dist_mi) = (float) v;
+            id(ltng_last_ms) = millis();
+          }
+      - if:
+          condition:
+            lambda: 'return id(ltng_dist_mi) < 900.0f;'
+          then:
+            - lvgl.label.update:
+                id: ltng_dist_lbl
+                text: !lambda |-
+                  char b[24]; snprintf(b,sizeof(b),"%.0f mi", id(ltng_dist_mi));
+                  return std::string(b);
       - if:
           condition:
             lambda: 'return id(ltng_dist_mi) < ${ltng_mid_mi};'
