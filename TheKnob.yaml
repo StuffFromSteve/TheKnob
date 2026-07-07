@@ -140,6 +140,12 @@ globals:
     type: uint32_t
     restore_value: false
     initial_value: "0"
+  - id: art_pending
+    type: std::string
+    restore_value: false
+  - id: art_last_ok
+    type: std::string
+    restore_value: false
 
 # --- Arc repaint (decoupled from encoder to avoid LVGL reentrancy crash) -------
 interval:
@@ -445,6 +451,8 @@ sensor:
     on_value:
       - lvgl.label.update:
           id: wx_press_lbl
+          # PirateWeather reports inHg already. If you repoint weather_entity to an
+          # hPa/mbar source, convert: x * 0.02953f
           text: !lambda 'char b[24]; snprintf(b,sizeof(b),"%.2f inHg", x); return std::string(b);'
   # Lightning compass
   - platform: homeassistant
@@ -686,15 +694,15 @@ text_sensor:
     attribute: entity_picture
     on_value:
       - lambda: |-
-          static std::string last_url;
           std::string p = x;
           if (p.empty()) return;
           std::string url = (p[0] == '/') ? std::string("${ha_base}") + p : p;
-          // MA imageproxy only accepts specific size values; 256 is valid, 128 is not (400)
+          // MA imageproxy only accepts specific size values; 256 is valid, 128 is not (400).
+          // NOTE: assumes MA appends "size=512"; if MA changes it, art just won't downscale.
           size_t q = url.find("size=512");
           if (q != std::string::npos) url.replace(q + 5, 3, "256");
-          if (url == last_url) return;   // ignore idle/playing flap re-firing same art
-          last_url = url;
+          if (url == id(art_last_ok)) return;   // already have this art (skip idle/playing flap)
+          id(art_pending) = url;                // committed to art_last_ok only on success
           id(album_art).set_url(url.c_str());
           id(album_art).update();
 
@@ -710,6 +718,7 @@ online_image:
     resize: 130x130
     update_interval: never
     on_download_finished:
+      - lambda: 'id(art_last_ok) = id(art_pending);'
       - lvgl.widget.show: art_widget
       - lvgl.image.update:
           id: art_widget
